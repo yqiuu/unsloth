@@ -1185,7 +1185,7 @@ def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
 
             unwrapped_model = self.accelerator.unwrap_model(model, keep_fp32_wrapper = False)
 
-            lm_head = self.model.get_output_embeddings().weight
+            lm_head = unwrapped_model.get_output_embeddings().weight
 
             dtype_bytes = 16 if self._autocast_dtype in [torch.float16, torch.bfloat16] else 32
             total_rows = input_ids.shape[0]
@@ -1337,11 +1337,11 @@ def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
                     image_sizes_chunks.append(slice_sample_axis(image_sizes, start, end))
 
             temperature = self.temperature
-            logit_softcapping = _unsloth_get_final_logit_softcapping(model.config)
-            logit_scale_multiply = getattr(model.config, "logit_scale", 0)
+            logit_softcapping = _unsloth_get_final_logit_softcapping(unwrapped_model.config)
+            logit_scale_multiply = getattr(unwrapped_model.config, "logit_scale", 0)
             if logit_scale_multiply is None:
                 logit_scale_multiply = 0
-            logit_scale_divide = getattr(model.config, "logits_scaling", 0)
+            logit_scale_divide = getattr(unwrapped_model.config, "logits_scaling", 0)
             if logit_scale_divide is None:
                 logit_scale_divide = 0
 
@@ -1554,6 +1554,9 @@ def grpo_trainer_compute_loss(function_name, function):
         )
         num_processes = self.accelerator.num_processes
 
+        # Unwrap DDP / mixed-precision wrappers so we can read .config safely
+        unwrapped_model = self.accelerator.unwrap_model(model, keep_fp32_wrapper = False)
+
         input_ids = torch.cat([prompt_ids, completion_ids], dim = 1)
         bsz, qlen = input_ids.shape
         attention_mask = torch.cat([prompt_mask, completion_mask], dim = 1)
@@ -1616,11 +1619,11 @@ def grpo_trainer_compute_loss(function_name, function):
         input_ids = input_ids[:, -logits_to_keep:]
 
         # Get logit softcapping and logit scale
-        logit_softcapping = _unsloth_get_final_logit_softcapping(model.config)  # Gemma
-        logit_scale_multiply = getattr(model.config, "logit_scale", 0)  # Cohere
+        logit_softcapping = _unsloth_get_final_logit_softcapping(unwrapped_model.config)  # Gemma
+        logit_scale_multiply = getattr(unwrapped_model.config, "logit_scale", 0)  # Cohere
         if logit_scale_multiply is None:
             logit_scale_multiply = 0
-        logit_scale_divide = getattr(model.config, "logits_scaling", 0)  # Granite
+        logit_scale_divide = getattr(unwrapped_model.config, "logits_scaling", 0)  # Granite
         if logit_scale_divide is None:
             logit_scale_divide = 0
 
