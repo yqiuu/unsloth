@@ -405,6 +405,333 @@ RL_FUNCTIONS["dpo_trainer"].append(dpo_trainer_compute_loss_liger)
 RL_EXTRA_ARGS["dpo_trainer"].append(dpo_trainer_data_collator_vision_keys)
 
 
+def dpo_trainer_compute_loss(function_name, function):
+    """Rewrite DPO _compute_loss to optionally compute log-probs from hidden states in chunks."""
+    if function_name != "_compute_loss":
+        return function
+
+    if "shift_logits = outputs.logits[..., :-1, :]" not in function:
+        return function
+
+    # ---- 1. Decide whether to use the chunked hidden-state path ----
+    old_setup = '''        _non_model_keys = {"completion_mask", "ref_chosen_logps", "ref_rejected_logps"}
+        model_kwargs = {k: v for k, v in inputs.items() if k not in _non_model_keys}
+        model_kwargs["use_cache"] = False
+        # MoE models: request router logits so the model returns `outputs.aux_loss`. VLM wrappers honor this only
+        # as a forward kwarg (not from the model config), so it must be passed here.
+        if self.aux_loss_enabled:
+            model_kwargs["output_router_logits"] = True
+        outputs = model(**model_kwargs)'''
+
+    new_setup = '''        _non_model_keys = {"completion_mask", "ref_chosen_logps", "ref_rejected_logps"}
+        model_kwargs = {k: v for k, v in inputs.items() if k not in _non_model_keys}
+        model_kwargs["use_cache"] = False
+        # Unsloth: decide whether to use the hidden-state / chunked log-prob path
+        _use_chunked = (
+            os.environ.get("UNSLOTH_DPO_CHUNKED_LOGPROBS", "0") == "1"
+            and not self.use_weighting
+            and not self.aux_loss_enabled
+            and "sft" not in self.loss_types
+            and not self.use_liger_kernel
+            and not return_outputs
+        )
+        # MoE models: request router logits so the model returns `outputs.aux_loss`. VLM wrappers honor this only
+        # as a forward kwarg (not from the model config), so it must be passed here.
+        if self.aux_loss_enabled:
+            model_kwargs["output_router_logits"] = True
+        if _use_chunked:
+            try:
+                os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
+                outputs = model(**model_kwargs)
+            finally:
+                os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
+        else:
+            outputs = model(**model_kwargs)'''
+
+    function = function.replace(old_setup, new_setup, 1)
+
+    # ---- 2. Policy per-token log-probs: hidden-state matmul or chunked-logits fallback ----
+    old_logps = '''        input_ids = inputs["input_ids"]
+        completion_mask = inputs["completion_mask"]
+        shift_logits = outputs.logits[..., :-1, :]
+        shift_labels = input_ids[..., 1:]
+        shift_completion_mask = completion_mask[..., 1:]
+        per_token_logps = selective_log_softmax(shift_logits, shift_labels)'''
+
+    new_logps = '''        input_ids = inputs["input_ids"]
+        completion_mask = inputs["completion_mask"]
+        shift_logits = outputs.logits[..., :-1, :]
+        shift_labels = input_ids[..., 1:]
+        shift_completion_mask = completion_mask[..., 1:]
+        if _use_chunked:
+            lm_head = self.accelerator.unwrap_model(model).get_output_embeddings().weight
+            if shift_logits.shape[-1] == lm_head.shape[1]:
+                per_token_logps = chunked_hidden_states_selective_log_softmax(
+                    shift_logits.to(lm_head.device),
+                    lm_head,
+                    shift_labels.to(lm_head.device),
+                    chunks = self.args.unsloth_num_chunks if self.args.unsloth_num_chunks > 0 else max(4, shift_labels.numel() // 4096),
+                )
+            else:
+                per_token_logps = chunked_selective_log_softmax(
+                    shift_logits,
+                    shift_labels.to(shift_logits.device),
+                    chunks = self.args.unsloth_num_chunks if self.args.unsloth_num_chunks > 0 else max(4, shift_logits.shape[0] * shift_logits.shape[1] // 4096),
+                )
+            per_token_logps = per_token_logps.to(shift_completion_mask.device)
+        else:
+            per_token_logps = selective_log_softmax(shift_logits, shift_labels)'''
+
+    function = function.replace(old_logps, new_logps, 1)
+
+    # ---- 3. Reference per-token log-probs: same idea under no_grad ----
+    old_ref = '''            with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+                if is_peft_model(model) and self.ref_model is None:
+                    # When training a PEFT adapter, how we obtain the reference depends on the setup:
+                    # - New adapter: disabling adapters yields the base model.
+                    # - Re-training an existing adapter: an initial copy is loaded under the name "ref".
+                    model = self.accelerator.unwrap_model(model)
+                    with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
+                        ref_outputs = self.model(**ref_model_kwargs)
+                else:
+                    ref_outputs = self.ref_model(**ref_model_kwargs)
+
+            ref_shift_logits = ref_outputs.logits[..., :-1, :]
+            ref_per_token_logps = selective_log_softmax(ref_shift_logits, shift_labels)'''
+
+    new_ref = '''            if _use_chunked:
+                try:
+                    os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
+                    with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+                        if is_peft_model(model) and self.ref_model is None:
+                            # When training a PEFT adapter, how we obtain the reference depends on the setup:
+                            # - New adapter: disabling adapters yields the base model.
+                            # - Re-training an existing adapter: an initial copy is loaded under the name "ref".
+                            model = self.accelerator.unwrap_model(model)
+                            with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
+                                ref_outputs = self.model(**ref_model_kwargs)
+                        else:
+                            ref_outputs = self.ref_model(**ref_model_kwargs)
+                finally:
+                    os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
+            else:
+                with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+                    if is_peft_model(model) and self.ref_model is None:
+                        # When training a PEFT adapter, how we obtain the reference depends on the setup:
+                        # - New adapter: disabling adapters yields the base model.
+                        # - Re-training an existing adapter: an initial copy is loaded under the name "ref".
+                        model = self.accelerator.unwrap_model(model)
+                        with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
+                            ref_outputs = self.model(**ref_model_kwargs)
+                    else:
+                        ref_outputs = self.ref_model(**ref_model_kwargs)
+
+            ref_shift_logits = ref_outputs.logits[..., :-1, :]
+            if _use_chunked:
+                ref_lm_head = self.accelerator.unwrap_model(self.model if self.ref_model is None else self.ref_model).get_output_embeddings().weight
+                if ref_shift_logits.shape[-1] == ref_lm_head.shape[1]:
+                    ref_per_token_logps = chunked_hidden_states_selective_log_softmax(
+                        ref_shift_logits.to(ref_lm_head.device),
+                        ref_lm_head,
+                        shift_labels.to(ref_lm_head.device),
+                        chunks = self.args.unsloth_num_chunks if self.args.unsloth_num_chunks > 0 else max(4, shift_labels.numel() // 4096),
+                    )
+                else:
+                    ref_per_token_logps = chunked_selective_log_softmax(
+                        ref_shift_logits,
+                        shift_labels.to(ref_shift_logits.device),
+                        chunks = self.args.unsloth_num_chunks if self.args.unsloth_num_chunks > 0 else max(4, ref_shift_logits.shape[0] * ref_shift_logits.shape[1] // 4096),
+                    )
+                ref_per_token_logps = ref_per_token_logps.to(shift_completion_mask.device)
+            else:
+                ref_per_token_logps = selective_log_softmax(ref_shift_logits, shift_labels)'''
+
+    function = function.replace(old_ref, new_ref, 1)
+
+    # ---- 4. Metrics that require full logits: skip in chunked mode ----
+    old_entropy = '''        # Entropy
+        per_token_entropy = entropy_from_logits(shift_logits.detach())
+        mask = shift_completion_mask
+        entropy_sum = (per_token_entropy * mask).sum()
+        total_tokens = mask.sum()
+
+        # Gather counts across ranks and weight-average
+        entropy_sum = self.accelerator.gather_for_metrics(entropy_sum).sum()
+        total_tokens = self.accelerator.gather_for_metrics(total_tokens).sum()
+        entropy = (entropy_sum / total_tokens).item() if total_tokens > 0 else 0.0
+        self._metrics[mode]["entropy"].append(entropy)'''
+
+    new_entropy = '''        # Entropy
+        if not _use_chunked:
+            per_token_entropy = entropy_from_logits(shift_logits.detach())
+            mask = shift_completion_mask
+            entropy_sum = (per_token_entropy * mask).sum()
+            total_tokens = mask.sum()
+
+            # Gather counts across ranks and weight-average
+            entropy_sum = self.accelerator.gather_for_metrics(entropy_sum).sum()
+            total_tokens = self.accelerator.gather_for_metrics(total_tokens).sum()
+            entropy = (entropy_sum / total_tokens).item() if total_tokens > 0 else 0.0
+            self._metrics[mode]["entropy"].append(entropy)
+        else:
+            self._metrics[mode]["entropy"].append(0.0)'''
+
+    function = function.replace(old_entropy, new_entropy, 1)
+
+    old_logits = '''        # Average logits for chosen and rejected completions
+        chosen_logits, rejected_logits = shift_logits.detach().chunk(2, dim=0)
+        chosen_mask, rejected_mask = shift_completion_mask.chunk(2, dim=0)
+        total_chosen_logits = chosen_logits[chosen_mask.bool()].mean(-1).sum()
+        total_chosen_tokens = chosen_mask.sum()
+        total_rejected_logits = rejected_logits[rejected_mask.bool()].mean(-1).sum()
+        total_rejected_tokens = rejected_mask.sum()
+        total_chosen_logits = self.accelerator.gather_for_metrics(total_chosen_logits).sum().item()
+        total_chosen_tokens = self.accelerator.gather_for_metrics(total_chosen_tokens).sum().item()
+        total_rejected_logits = self.accelerator.gather_for_metrics(total_rejected_logits).sum().item()
+        total_rejected_tokens = self.accelerator.gather_for_metrics(total_rejected_tokens).sum().item()
+        avg_chosen_logits = total_chosen_logits / total_chosen_tokens if total_chosen_tokens > 0 else 0.0
+        avg_rejected_logits = total_rejected_logits / total_rejected_tokens if total_rejected_tokens > 0 else 0.0
+        self._metrics[mode]["logits/chosen"].append(avg_chosen_logits)
+        self._metrics[mode]["logits/rejected"].append(avg_rejected_logits)
+
+        # Token accuracy for the chosen completions
+        predictions = chosen_logits.argmax(dim=-1)
+        chosen_mask = shift_completion_mask[: len(shift_completion_mask) // 2].bool()
+        chosen_labels = shift_labels[: len(shift_labels) // 2]
+        correct_predictions = (predictions == chosen_labels) & chosen_mask
+        total_tokens = chosen_mask.sum()
+        correct_tokens = correct_predictions.sum()
+        correct_tokens = self.accelerator.gather_for_metrics(correct_tokens)
+        total_tokens = self.accelerator.gather_for_metrics(total_tokens)
+        total_sum = total_tokens.sum()
+        accuracy = (correct_tokens.sum() / total_sum).item() if total_sum > 0 else 0.0
+        self._metrics[mode]["mean_token_accuracy"].append(accuracy)'''
+
+    new_logits = '''        # Average logits for chosen and rejected completions
+        if not _use_chunked:
+            chosen_logits, rejected_logits = shift_logits.detach().chunk(2, dim=0)
+            chosen_mask, rejected_mask = shift_completion_mask.chunk(2, dim=0)
+            total_chosen_logits = chosen_logits[chosen_mask.bool()].mean(-1).sum()
+            total_chosen_tokens = chosen_mask.sum()
+            total_rejected_logits = rejected_logits[rejected_mask.bool()].mean(-1).sum()
+            total_rejected_tokens = rejected_mask.sum()
+            total_chosen_logits = self.accelerator.gather_for_metrics(total_chosen_logits).sum().item()
+            total_chosen_tokens = self.accelerator.gather_for_metrics(total_chosen_tokens).sum().item()
+            total_rejected_logits = self.accelerator.gather_for_metrics(total_rejected_logits).sum().item()
+            total_rejected_tokens = self.accelerator.gather_for_metrics(total_rejected_tokens).sum().item()
+            avg_chosen_logits = total_chosen_logits / total_chosen_tokens if total_chosen_tokens > 0 else 0.0
+            avg_rejected_logits = total_rejected_logits / total_rejected_tokens if total_rejected_tokens > 0 else 0.0
+            self._metrics[mode]["logits/chosen"].append(avg_chosen_logits)
+            self._metrics[mode]["logits/rejected"].append(avg_rejected_logits)
+
+            # Token accuracy for the chosen completions
+            predictions = chosen_logits.argmax(dim=-1)
+            chosen_mask = shift_completion_mask[: len(shift_completion_mask) // 2].bool()
+            chosen_labels = shift_labels[: len(shift_labels) // 2]
+            correct_predictions = (predictions == chosen_labels) & chosen_mask
+            total_tokens = chosen_mask.sum()
+            correct_tokens = correct_predictions.sum()
+            correct_tokens = self.accelerator.gather_for_metrics(correct_tokens)
+            total_tokens = self.accelerator.gather_for_metrics(total_tokens)
+            total_sum = total_tokens.sum()
+            accuracy = (correct_tokens.sum() / total_sum).item() if total_sum > 0 else 0.0
+            self._metrics[mode]["mean_token_accuracy"].append(accuracy)
+        else:
+            self._metrics[mode]["logits/chosen"].append(0.0)
+            self._metrics[mode]["logits/rejected"].append(0.0)
+            self._metrics[mode]["mean_token_accuracy"].append(0.0)'''
+
+    function = function.replace(old_logits, new_logits, 1)
+
+    return function
+
+
+def dpo_trainer_compute_ref_log_probs(function_name, function):
+    """Rewrite DPO compute_ref_log_probs to optionally use chunked hidden-state log-probs."""
+    if function_name != "compute_ref_log_probs":
+        return function
+
+    if "ref_shift_logits = ref_outputs.logits[..., :-1, :]" not in function:
+        return function
+
+    old = '''        with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+            if self.ref_model is None:
+                if is_peft_model(self.model):
+                    model = self.accelerator.unwrap_model(self.model)
+                    with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
+                        ref_outputs = self.model(**model_kwargs)
+                else:
+                    ref_outputs = self.model(**model_kwargs)
+            else:
+                ref_outputs = self.ref_model(**model_kwargs)
+
+        input_ids = inputs["input_ids"]
+        completion_mask = inputs["completion_mask"]
+        shift_labels = input_ids[..., 1:]
+        shift_completion_mask = completion_mask[..., 1:]
+        ref_shift_logits = ref_outputs.logits[..., :-1, :]
+        ref_per_token_logps = selective_log_softmax(ref_shift_logits, shift_labels)'''
+
+    new = '''        _use_chunked = os.environ.get("UNSLOTH_DPO_CHUNKED_LOGPROBS", "0") == "1"
+        if _use_chunked:
+            try:
+                os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
+                with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+                    if self.ref_model is None:
+                        if is_peft_model(self.model):
+                            model = self.accelerator.unwrap_model(self.model)
+                            with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
+                                ref_outputs = self.model(**model_kwargs)
+                        else:
+                            ref_outputs = self.model(**model_kwargs)
+                    else:
+                        ref_outputs = self.ref_model(**model_kwargs)
+            finally:
+                os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
+        else:
+            with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+                if self.ref_model is None:
+                    if is_peft_model(self.model):
+                        model = self.accelerator.unwrap_model(self.model)
+                        with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
+                            ref_outputs = self.model(**model_kwargs)
+                    else:
+                        ref_outputs = self.model(**model_kwargs)
+                else:
+                    ref_outputs = self.ref_model(**model_kwargs)
+
+        input_ids = inputs["input_ids"]
+        completion_mask = inputs["completion_mask"]
+        shift_labels = input_ids[..., 1:]
+        shift_completion_mask = completion_mask[..., 1:]
+        ref_shift_logits = ref_outputs.logits[..., :-1, :]
+        if _use_chunked:
+            ref_lm_head = self.accelerator.unwrap_model(self.model if self.ref_model is None else self.ref_model).get_output_embeddings().weight
+            if ref_shift_logits.shape[-1] == ref_lm_head.shape[1]:
+                ref_per_token_logps = chunked_hidden_states_selective_log_softmax(
+                    ref_shift_logits.to(ref_lm_head.device),
+                    ref_lm_head,
+                    shift_labels.to(ref_lm_head.device),
+                    chunks = self.args.unsloth_num_chunks if self.args.unsloth_num_chunks > 0 else max(4, shift_labels.numel() // 4096),
+                )
+            else:
+                ref_per_token_logps = chunked_selective_log_softmax(
+                    ref_shift_logits,
+                    shift_labels.to(ref_shift_logits.device),
+                    chunks = self.args.unsloth_num_chunks if self.args.unsloth_num_chunks > 0 else max(4, ref_shift_logits.shape[0] * ref_shift_logits.shape[1] // 4096),
+                )
+            ref_per_token_logps = ref_per_token_logps.to(shift_completion_mask.device)
+        else:
+            ref_per_token_logps = selective_log_softmax(ref_shift_logits, shift_labels)'''
+
+    function = function.replace(old, new, 1)
+    return function
+
+
+RL_FUNCTIONS["dpo_trainer"].append(dpo_trainer_compute_loss)
+RL_FUNCTIONS["dpo_trainer"].append(dpo_trainer_compute_ref_log_probs)
+
+
 # Fix tokenizer double BOS
 def sft_trainer_prepare_dataset(function_name, function):
     if function_name != "_prepare_non_packed_dataloader" and function_name != "_prepare_dataset":
